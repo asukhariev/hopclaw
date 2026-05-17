@@ -79,22 +79,53 @@ function listSlkAndCsv(dirPath) {
  * end-to-end. Real driving plugs into the same callsite.
  */
 async function driveExport() {
-  // Snapshot before
-  const before = new Set(listSlkAndCsv(DIR).map((f) => f.name));
+  // Trigger the HopClawDriveExport scheduled task (runs in the user's
+  // interactive RDP session — required for SendKeys/UI Automation to reach
+  // the MR4 window). The PS script writes one of:
+  //   C:\hopclaw\drive-export.ok    -> full path to the new file
+  //   C:\hopclaw\drive-export.err   -> error message
+  const okPath  = "C:\\hopclaw\\drive-export.ok";
+  const errPath = "C:\\hopclaw\\drive-export.err";
+  const exportDir = path.join(DIR, "exports");
 
-  // TODO real export sequence — call PowerShell scripts:
-  //   spawnSync("powershell.exe", ["-File", path.join(DIR, "drive-export.ps1")])
-  // For v0 we skip and rely on whatever's already in DIR.
+  // Snapshot before — used as fallback if marker file logic misses
+  const before = new Set(listSlkAndCsv(exportDir).map((f) => f.name));
 
-  // After
-  const after = listSlkAndCsv(DIR);
-  const newOnes = after.filter((f) => !before.has(f.name));
-  // Prefer a brand-new file, otherwise fall back to the most recent
-  const pick = newOnes[0] || after[0];
-  if (!pick) {
-    throw new Error(`no .slk or .csv file in ${DIR}`);
+  // Clear stale markers
+  for (const p of [okPath, errPath]) {
+    try { fs.unlinkSync(p); } catch { /* ignore */ }
   }
-  return pick;
+
+  log("Triggering MR4 export via scheduled task...");
+  const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveExport"], { encoding: "utf-8" });
+  if (trig.status !== 0) {
+    throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
+  }
+
+  // Poll for completion marker (max 90 sec — covers Mesa-rendered MR4 + dialogs)
+  const deadline = Date.now() + 90_000;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(okPath)) {
+      const newFilePath = fs.readFileSync(okPath, "utf-8").trim();
+      log("Export OK:", newFilePath);
+      const st = fs.statSync(newFilePath);
+      return { name: path.basename(newFilePath), path: newFilePath, mtime: st.mtimeMs, size: st.size };
+    }
+    if (fs.existsSync(errPath)) {
+      const msg = fs.readFileSync(errPath, "utf-8").trim();
+      throw new Error(`drive-export reported: ${msg}`);
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
+  // Timeout fallback: if there's a brand-new file in the exports dir, use it
+  const after = listSlkAndCsv(exportDir);
+  const newOnes = after.filter((f) => !before.has(f.name));
+  if (newOnes[0]) {
+    log("WARN: no marker file but found new export, using it");
+    return newOnes[0];
+  }
+  throw new Error("drive-export timed out (90s) and no new file appeared");
 }
 
 async function uploadToBlob(sessionId, filePath) {
