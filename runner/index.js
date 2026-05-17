@@ -175,24 +175,49 @@ async function handleStop(sessionId) {
 }
 
 async function handleStart(sessionId) {
-  // For v0 there's no proactive sensor wiring. We just acknowledge that
-  // recording is in progress; the technician drives MR4 themselves.
+  // Recording acknowledged. Technician records in MR4 (or, in cloud demo,
+  // there's a pre-existing demo record waiting to be exported). When the
+  // user clicks Stop, handleStop drives the actual MR4 export.
   await postEvent({
     session_id: sessionId,
     status: "recording",
-    progress: "Runner online. Record in MR4, then hit Stop & Export.",
+    progress: "Session running. Click Stop & Export when ready.",
   });
 }
+
+let currentSessionId = null;
 
 async function tick() {
   try {
     const cmd = await poll();
     if (cmd.type === "noop") return;
     log("Command:", cmd);
-    if (cmd.type === "start") await handleStart(cmd.session_id);
-    if (cmd.type === "stop")  await handleStop(cmd.session_id);
+    if (cmd.type === "start") {
+      currentSessionId = cmd.session_id;
+      await handleStart(cmd.session_id);
+    }
+    if (cmd.type === "stop") {
+      currentSessionId = cmd.session_id;
+      await handleStop(cmd.session_id);
+    }
   } catch (err) {
     log("Tick error:", err.message);
+    // Mark the in-flight session as failed so the UI doesn't get stuck
+    if (currentSessionId) {
+      try {
+        await postEvent({
+          session_id: currentSessionId,
+          status: "failed",
+          error: err.message,
+          progress: `Failed: ${err.message}`,
+        });
+        log("Marked session", currentSessionId, "as failed");
+      } catch (postErr) {
+        log("Also failed to post failure status:", postErr.message);
+      }
+    }
+  } finally {
+    currentSessionId = null;
   }
 }
 
