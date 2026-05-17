@@ -1,0 +1,7 @@
+runner/node_modules
+runner/.env
+dev/aws/.aws-state.env
+dev/aws/hopclaw-win.rdp
+dev/aws/*.pem
+runs/
+*.log

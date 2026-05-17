@@ -1,0 +1,19 @@
+{
+  "name": "hopclaw-runner",
+  "version": "0.1.0",
+  "description": "Long-running poller on the lab Windows VM. Picks up commands from hop.agtc.app, drives MR4 export, uploads CSV to Vercel Blob.",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "hopclaw-runner": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@vercel/blob": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
