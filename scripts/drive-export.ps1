@@ -1,14 +1,15 @@
 # Drive MR4 Database -> Export -> Excel SLK end-to-end.
-# Validated on 2026-05-17 at 1440x900 native resolution.
+# Re-mapped on 2026-05-23 for HOP Studio lab PC at 1600x900 (MR 4.0.106).
+# Original calibration: 1440x900 / MR 4.0.124.
 #
 # Sequence (each step proven manually):
 #   1. Focus MR4 + Escape x2 (dismiss any popups)
-#   2. Click Database tab            -> (1085, 48)
+#   2. Click Database tab            -> (1248, 47)
 #   3. Escape (dismiss possible Save changes dialog)
-#   4. Click first record row        -> (685, 192)
-#   5. Click Export button           -> (1280, 505)
-#   6. Click Excel SLK menu item     -> (1280, 244)
-#   7. Type "exports" + click Select Folder -> (516, 468)
+#   4. Click first record row        -> (820, 193)
+#   5. Click Export button           -> (1461, 458)
+#   6. Click Excel SLK menu item     -> (1379, 539)
+#   7. Type full path + click Select Folder -> (611, 464)
 #   8. Enter on filename dialog
 #   9. Wait for export to write
 #   10. Enter on success dialog
@@ -19,11 +20,16 @@
 $ErrorActionPreference = "Continue"
 
 $exportDir   = "C:\hopclaw\exports"
+$desktopDir  = [Environment]::GetFolderPath("Desktop")
 $markerOk    = "C:\hopclaw\drive-export.ok"
 $markerErr   = "C:\hopclaw\drive-export.err"
 $logFile     = "C:\hopclaw\drive-export.log"
-$expectedW   = 1440
+$expectedW   = 1600
 $expectedH   = 900
+$scriptStart = Get-Date
+# Per-run prefix prepended to MR4's default filename so concurrent/repeat
+# exports don't overwrite each other. Format: yyMMdd_HHmmss_  (13 chars).
+$uniquePrefix = (Get-Date -Format 'yyMMdd_HHmmss_')
 
 New-Item -ItemType Directory -Path $exportDir -Force | Out-Null
 Remove-Item $markerOk, $markerErr -ErrorAction SilentlyContinue
@@ -86,7 +92,7 @@ try {
 
     Write-Host ""
     Write-Host "STEP 2. Click Database tab"
-    Click 1085 48 "Database tab"
+    Click 1248 47 "Database tab"
     Start-Sleep -Seconds 1
 
     Write-Host ""
@@ -95,29 +101,34 @@ try {
     Start-Sleep -Milliseconds 500
 
     Write-Host ""
-    Write-Host "STEP 4. Click first record (Bilateral Gait)"
-    Click 685 192 "record row"
+    Write-Host "STEP 4. Click first record row"
+    Click 820 193 "record row"
     Start-Sleep -Milliseconds 500
 
     Write-Host ""
     Write-Host "STEP 5. Click Export button"
-    Click 1280 505 "Export button"
+    Click 1461 458 "Export button"
     Start-Sleep -Seconds 1
 
     Write-Host ""
     Write-Host "STEP 6. Click Excel SLK menu item"
-    Click 1280 244 "Excel SLK"
+    Click 1379 539 "Excel SLK"
     Start-Sleep -Seconds 2
 
     Write-Host ""
-    Write-Host "STEP 7. In folder picker: type 'exports' + click Select Folder"
-    Send "exports" "type exports"
+    Write-Host "STEP 7. In folder picker (Pasta auto-focused): type full path + Enter"
+    Send "C:\hopclaw\exports" "type full path in Pasta field"
     Start-Sleep -Milliseconds 600
-    Click 516 468 "Select Folder button"
+    Send "{ENTER}" "submit selection"
     Start-Sleep -Seconds 2
 
     Write-Host ""
-    Write-Host "STEP 8. Enter on filename dialog"
+    Write-Host "STEP 8. Filename dialog: prepend unique prefix + Enter"
+    # Filename is typically auto-selected; {HOME} deselects and puts cursor at start
+    Send "{HOME}" "cursor to start"
+    Start-Sleep -Milliseconds 200
+    Send $uniquePrefix "prepend $uniquePrefix"
+    Start-Sleep -Milliseconds 400
     Send "{ENTER}" "ok filename"
     Start-Sleep -Seconds 2
 
@@ -127,7 +138,7 @@ try {
     Start-Sleep -Seconds 2
 
     Write-Host ""
-    Write-Host "STEP 9. Wait for new file (max 60s)"
+    Write-Host "STEP 9. Wait for new file (max 60s) in exports OR desktop fallback"
     $deadline = (Get-Date).AddSeconds(60)
     $newFile = $null
     while ((Get-Date) -lt $deadline) {
@@ -137,6 +148,24 @@ try {
             if ($isNew -and $f.Length -gt 1000) {
                 $newFile = $f
                 break
+            }
+        }
+        if ($newFile) { break }
+
+        # Desktop fallback: MR4 sometimes ignores the folder picker and saves
+        # to last-used location (Desktop). Move any new .slk created since
+        # script start into the exports dir.
+        $stray = Get-ChildItem $desktopDir -Filter *.slk -ErrorAction SilentlyContinue |
+                 Where-Object { $_.LastWriteTime -ge $scriptStart -and $_.Length -gt 1000 }
+        foreach ($s in $stray) {
+            $dest = Join-Path $exportDir $s.Name
+            Write-Host "  desktop-fallback: moving $($s.Name) -> $exportDir"
+            try {
+                Move-Item -Path $s.FullName -Destination $dest -Force -ErrorAction Stop
+                $newFile = Get-Item $dest
+                break
+            } catch {
+                Write-Host "    move failed: $($_.Exception.Message)"
             }
         }
         if ($newFile) { break }
