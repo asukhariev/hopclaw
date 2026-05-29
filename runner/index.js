@@ -252,7 +252,7 @@ async function driveSubjectSelect(subjectName) {
   log("Triggering MR4 subject select:", subjectName);
   const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawSelectSubject"], { encoding: "utf-8" });
   if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
-  const deadline = Date.now() + 45_000;
+  const deadline = Date.now() + 75_000;
   while (Date.now() < deadline) {
     if (fs.existsSync(okPath)) return true;
     if (fs.existsSync(errPath)) return false;
@@ -265,12 +265,13 @@ async function handleSubjectJob(job) {
   currentSubjectCustomerId = job.customer_id;
   const code = (job.mr4_code || "").toLowerCase();
 
-  if (job.kind === "find") {
-    const subjects = listMr4Subjects();
-    const found = !!code && subjects.some((s) => (s.firstName || "").toLowerCase().includes(code));
-    log(`find: code='${code}' among ${subjects.length} MR4 subjects -> ${found ? "linked" : "not_found"}`);
+  if (job.kind === "find" || job.kind === "select") {
+    // Select-as-check: locate the subject in MR4's live dropdown (covers in-memory
+    // subjects) and select it. Success = found AND now selected; fail = not in MR4.
+    const ok = await driveSubjectSelect(job.subject_name);
+    log(`select-as-check '${job.subject_name}' -> ${ok ? "linked" : "not_found"}`);
     await postSubjectEvent(
-      found
+      ok
         ? { customer_id: job.customer_id, result: "linked", subject_name: job.subject_name }
         : { customer_id: job.customer_id, result: "not_found" }
     );
@@ -283,13 +284,6 @@ async function handleSubjectJob(job) {
       await driveSubjectCreate(job.subject_name);
     }
     await postSubjectEvent({ customer_id: job.customer_id, result: "linked", subject_name: job.subject_name });
-  } else if (job.kind === "select") {
-    const ok = await driveSubjectSelect(job.subject_name);
-    await postSubjectEvent(
-      ok
-        ? { customer_id: job.customer_id, result: "linked", subject_name: job.subject_name }
-        : { customer_id: job.customer_id, result: "not_found" }
-    );
   }
   currentSubjectCustomerId = null;
 }
