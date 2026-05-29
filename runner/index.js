@@ -243,16 +243,22 @@ async function driveSubjectCreate(subjectName) {
   }
 }
 
-async function uploadProof(customerId, filePath) {
-  const data = fs.readFileSync(filePath);
-  const { url } = await put(`mr4-proof/${customerId}.png`, data, {
-    access: "public",
-    contentType: "image/png",
-    token: BLOB_TOK || undefined,
-    addRandomSuffix: false,
-    allowOverwrite: true,
-  });
-  return { url, size: data.length };
+/** Drive the select-subject scheduled task; returns true if found+selected. */
+async function driveSubjectSelect(subjectName) {
+  const okPath = `${DIR}\\select-subject.ok`;
+  const errPath = `${DIR}\\select-subject.err`;
+  for (const p of [okPath, errPath]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  fs.writeFileSync(`${DIR}\\subject.select`, subjectName, "ascii");
+  log("Triggering MR4 subject select:", subjectName);
+  const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawSelectSubject"], { encoding: "utf-8" });
+  if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
+  const deadline = Date.now() + 45_000;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(okPath)) return true;
+    if (fs.existsSync(errPath)) return false;
+    await sleep(1500);
+  }
+  return false;
 }
 
 async function handleSubjectJob(job) {
@@ -269,19 +275,21 @@ async function handleSubjectJob(job) {
         : { customer_id: job.customer_id, result: "not_found" }
     );
   } else if (job.kind === "create") {
-    const proofPath = await driveSubjectCreate(job.subject_name);
-    let proofUrl;
-    try {
-      proofUrl = (await uploadProof(job.customer_id, proofPath)).url;
-      log("Proof uploaded:", proofUrl);
-    } catch (e) {
-      log("WARN: proof upload failed:", e.message);
+    // Guard against duplicates: if we already linked this customer, the subject
+    // exists in MR4 (possibly only in memory, so find can't see it) — don't recreate.
+    if (job.already_linked) {
+      log(`create skipped — already linked, avoiding duplicate: ${job.subject_name}`);
+    } else {
+      await driveSubjectCreate(job.subject_name);
     }
-    await postSubjectEvent({ customer_id: job.customer_id, result: "linked", subject_name: job.subject_name, proof_url: proofUrl });
-  } else {
-    // select — not yet wired reliably; treat as linked without re-selecting.
-    log(`subject job kind '${job.kind}' not implemented; marking linked: ${job.subject_name}`);
     await postSubjectEvent({ customer_id: job.customer_id, result: "linked", subject_name: job.subject_name });
+  } else if (job.kind === "select") {
+    const ok = await driveSubjectSelect(job.subject_name);
+    await postSubjectEvent(
+      ok
+        ? { customer_id: job.customer_id, result: "linked", subject_name: job.subject_name }
+        : { customer_id: job.customer_id, result: "not_found" }
+    );
   }
   currentSubjectCustomerId = null;
 }
