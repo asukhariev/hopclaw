@@ -8,7 +8,7 @@
  *   RUNNER_API_KEY          shared secret; matches RUNNER_API_KEY in hopapp
  *   BLOB_READ_WRITE_TOKEN   Vercel Blob token for direct uploads
  *   HOPCLAW_DIR             default C:\hopclaw   (where MR4 exports land)
- *   POLL_MS                 default 5000
+ *   POLL_MS                 default 500
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -19,7 +19,14 @@ const HOPAPP   = process.env.HOPAPP_URL || "https://hop.agtc.app";
 const KEY      = process.env.RUNNER_API_KEY || "";
 const BLOB_TOK = process.env.BLOB_READ_WRITE_TOKEN || "";
 const DIR      = process.env.HOPCLAW_DIR || "C:\\hopclaw";
-const POLL_MS  = Number(process.env.POLL_MS || 5000);
+const POLL_MS  = Number(process.env.POLL_MS || 500);
+
+// Long-poll tuning. The server holds /api/runner/poll open until a command is
+// ready or ~25s passes; the runner re-polls immediately on each response.
+const LONG_POLL_TIMEOUT_MS = 30_000; // client abort; must exceed the server's ~25s hold
+const IDLE_FLOOR_MS = POLL_MS;       // min gap only if the server returns fast (pre-deploy short-poll)
+const ERROR_BACKOFF_MS = 2000;       // back off after a failed poll/handle
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -32,9 +39,21 @@ function authHeaders(extra = {}) {
 }
 
 async function poll() {
-  const r = await fetch(`${HOPAPP}/api/runner/poll`, { headers: authHeaders() });
-  if (!r.ok) throw new Error(`poll http ${r.status}`);
-  return r.json();
+  // Long-poll: the server holds this request open until a command is ready (or
+  // ~25s elapses). Abort a bit past the server's deadline so a dead connection
+  // can't hang the loop forever.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), LONG_POLL_TIMEOUT_MS);
+  try {
+    const r = await fetch(`${HOPAPP}/api/runner/poll`, {
+      headers: authHeaders(),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) throw new Error(`poll http ${r.status}`);
+    return r.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function postEvent(body) {
@@ -187,54 +206,59 @@ async function handleStart(sessionId) {
 
 let currentSessionId = null;
 
-async function tick() {
-  try {
-    const cmd = await poll();
-    if (cmd.type === "noop") return;
-    log("Command:", cmd);
-    if (cmd.type === "start") {
-      currentSessionId = cmd.session_id;
-      await handleStart(cmd.session_id);
-      // Auto-chain into the export flow so the operator only presses Start.
-      // (Real-recording mode would wait for an explicit stop command instead.)
-      log("Auto-chaining into export flow for session", cmd.session_id);
-      await handleStop(cmd.session_id);
-    }
-    if (cmd.type === "stop") {
-      currentSessionId = cmd.session_id;
-      await handleStop(cmd.session_id);
-    }
-  } catch (err) {
-    log("Tick error:", err.message);
-    // Mark the in-flight session as failed so the UI doesn't get stuck
-    if (currentSessionId) {
-      try {
-        await postEvent({
-          session_id: currentSessionId,
-          status: "failed",
-          error: err.message,
-          progress: `Failed: ${err.message}`,
-        });
-        log("Marked session", currentSessionId, "as failed");
-      } catch (postErr) {
-        log("Also failed to post failure status:", postErr.message);
-      }
-    }
-  } finally {
-    currentSessionId = null;
+async function handleCommand(cmd) {
+  if (cmd.type === "start") {
+    currentSessionId = cmd.session_id;
+    await handleStart(cmd.session_id);
+    // Auto-chain into the export flow so the operator only presses Start.
+    // (Real-recording mode would wait for an explicit stop command instead.)
+    log("Auto-chaining into export flow for session", cmd.session_id);
+    await handleStop(cmd.session_id);
+  } else if (cmd.type === "stop") {
+    currentSessionId = cmd.session_id;
+    await handleStop(cmd.session_id);
   }
 }
 
 async function main() {
-  log(`HopClaw runner starting`);
+  log(`HopClaw runner starting (long-poll)`);
   log(`  HOPAPP_URL      = ${HOPAPP}`);
   log(`  HOPCLAW_DIR     = ${DIR}`);
-  log(`  POLL_MS         = ${POLL_MS}`);
+  log(`  IDLE_FLOOR_MS   = ${IDLE_FLOOR_MS}`);
   log(`  RUNNER_API_KEY  = ${KEY ? "(set)" : "(unset)"}`);
   log(`  BLOB_READ_WRITE_TOKEN = ${BLOB_TOK ? "(set)" : "(unset)"}`);
   for (;;) {
-    await tick();
-    await new Promise((r) => setTimeout(r, POLL_MS));
+    const startedAt = Date.now();
+    try {
+      const cmd = await poll(); // blocks until a command is ready or the server's deadline
+      if (cmd.type !== "noop") {
+        log("Command:", cmd);
+        await handleCommand(cmd);
+      }
+    } catch (err) {
+      log("Loop error:", err.message);
+      // Mark the in-flight session as failed so the UI doesn't get stuck
+      if (currentSessionId) {
+        try {
+          await postEvent({
+            session_id: currentSessionId,
+            status: "failed",
+            error: err.message,
+            progress: `Failed: ${err.message}`,
+          });
+          log("Marked session", currentSessionId, "as failed");
+        } catch (postErr) {
+          log("Also failed to post failure status:", postErr.message);
+        }
+      }
+      await sleep(ERROR_BACKOFF_MS);
+    } finally {
+      currentSessionId = null;
+    }
+    // The server already waited; this floor only prevents a hot loop if it
+    // returned almost instantly (e.g. an old short-poll deployment).
+    const elapsed = Date.now() - startedAt;
+    if (elapsed < IDLE_FLOOR_MS) await sleep(IDLE_FLOOR_MS - elapsed);
   }
 }
 
