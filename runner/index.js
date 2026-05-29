@@ -195,6 +195,10 @@ async function tick() {
     if (cmd.type === "start") {
       currentSessionId = cmd.session_id;
       await handleStart(cmd.session_id);
+      // Auto-chain into the export flow so the operator only presses Start.
+      // (Real-recording mode would wait for an explicit stop command instead.)
+      log("Auto-chaining into export flow for session", cmd.session_id);
+      await handleStop(cmd.session_id);
     }
     if (cmd.type === "stop") {
       currentSessionId = cmd.session_id;
