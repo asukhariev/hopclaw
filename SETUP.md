@@ -36,8 +36,8 @@ of every session, `commit + push` at the end.
 | Placeholder | Meaning | Example shape |
 | --- | --- | --- |
 | `<WIN_HOST>` | Windows hostname | `desktop-xxxxxxx` |
-| `<WIN_USER>` | day-to-day login on the box (often a **standard**, non-admin user) | `admin` |
-| `<WIN_ADMIN>` | a real **Administrator** account on the box (for one-time installs) | `Administrador` / `Hoplab` |
+| `<WIN_USER>` | day-to-day login on the box (often a **standard**, non-admin user) | `labuser` |
+| `<WIN_ADMIN>` | a real **Administrator** account on the box (for one-time installs) | `Administrator` / `<client-admin>` |
 | `<TAILNET>` | your Tailscale MagicDNS tailnet suffix | `tailXXXXXX.ts.net` |
 | `<MAC_KEY>` | per-machine SSH key path on the Mac | `~/.ssh/hopclaw_<label>` |
 | `<REPO_URL>` | the HopClaw git remote | `https://github.com/<org>/hopclaw.git` |
