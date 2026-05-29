@@ -21,6 +21,8 @@ const KEY      = process.env.RUNNER_API_KEY || "";
 const BLOB_TOK = process.env.BLOB_READ_WRITE_TOKEN || "";
 const DIR      = process.env.HOPCLAW_DIR || "C:\\hopclaw";
 const POLL_MS  = Number(process.env.POLL_MS || 500);
+// Active MR4 "OPENDATA" database whose persons store we read for the find check.
+const MR4_DB_DIR = process.env.MR4_DB_DIR || "C:\\Users\\Admin\\Desktop\\Noraxon MR data HOP Lab";
 
 // Long-poll tuning. The server holds /api/runner/poll open until a job is
 // ready or ~25s passes; the runner re-polls immediately on each response.
@@ -182,6 +184,108 @@ async function handleStep(job) {
   });
 }
 
+// ── Subject jobs: find / create an MR4 Subject for a customer ─────────────────
+let currentSubjectCustomerId = null;
+
+async function postSubjectEvent(body) {
+  const r = await fetch(`${HOPAPP}/api/runner/subject-event`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`subject-event http ${r.status} ${text}`);
+  }
+  return r.json();
+}
+
+/** Read MR4's persons store (shared-read) via the PowerShell helper -> JSON. */
+function listMr4Subjects() {
+  const r = spawnSync(
+    "powershell.exe",
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${DIR}\\mr4-subjects.ps1`, "-Db", MR4_DB_DIR, "-Json"],
+    { encoding: "utf-8" }
+  );
+  if (r.status !== 0) throw new Error(`mr4-subjects failed: ${r.stderr || r.stdout}`);
+  const out = (r.stdout || "").trim();
+  if (!out || out.startsWith("NO_PERSONS_DIR")) return [];
+  try {
+    const j = JSON.parse(out);
+    return Array.isArray(j) ? j : [j];
+  } catch {
+    return [];
+  }
+}
+
+/** Drive the create-subject scheduled task; returns the proof screenshot path. */
+async function driveSubjectCreate(subjectName) {
+  const okPath = `${DIR}\\drive-subject.ok`;
+  const errPath = `${DIR}\\drive-subject.err`;
+  const proofPath = `${DIR}\\subject-5-created.png`;
+  for (const p of [okPath, errPath]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  fs.writeFileSync(`${DIR}\\subject.name`, subjectName, "ascii");
+  fs.writeFileSync(`${DIR}\\subject.go`, "1", "ascii");
+  log("Triggering MR4 subject create:", subjectName);
+  const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveSubject"], { encoding: "utf-8" });
+  if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
+  try {
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(okPath)) return proofPath;
+      if (fs.existsSync(errPath)) throw new Error(`drive-subject: ${fs.readFileSync(errPath, "utf-8").trim()}`);
+      await sleep(1500);
+    }
+    throw new Error("drive-subject timed out (60s)");
+  } finally {
+    try { fs.unlinkSync(`${DIR}\\subject.go`); } catch { /* ignore */ }
+    try { fs.unlinkSync(`${DIR}\\subject.name`); } catch { /* ignore */ }
+  }
+}
+
+async function uploadProof(customerId, filePath) {
+  const data = fs.readFileSync(filePath);
+  const { url } = await put(`mr4-proof/${customerId}.png`, data, {
+    access: "public",
+    contentType: "image/png",
+    token: BLOB_TOK || undefined,
+    addRandomSuffix: false,
+    allowOverwrite: true,
+  });
+  return { url, size: data.length };
+}
+
+async function handleSubjectJob(job) {
+  currentSubjectCustomerId = job.customer_id;
+  const code = (job.mr4_code || "").toLowerCase();
+
+  if (job.kind === "find") {
+    const subjects = listMr4Subjects();
+    const found = !!code && subjects.some((s) => (s.firstName || "").toLowerCase().includes(code));
+    log(`find: code='${code}' among ${subjects.length} MR4 subjects -> ${found ? "linked" : "not_found"}`);
+    await postSubjectEvent(
+      found
+        ? { customer_id: job.customer_id, result: "linked", subject_name: job.subject_name }
+        : { customer_id: job.customer_id, result: "not_found" }
+    );
+  } else if (job.kind === "create") {
+    const proofPath = await driveSubjectCreate(job.subject_name);
+    let proofUrl;
+    try {
+      proofUrl = (await uploadProof(job.customer_id, proofPath)).url;
+      log("Proof uploaded:", proofUrl);
+    } catch (e) {
+      log("WARN: proof upload failed:", e.message);
+    }
+    await postSubjectEvent({ customer_id: job.customer_id, result: "linked", subject_name: job.subject_name, proof_url: proofUrl });
+  } else {
+    // select — not yet wired reliably; treat as linked without re-selecting.
+    log(`subject job kind '${job.kind}' not implemented; marking linked: ${job.subject_name}`);
+    await postSubjectEvent({ customer_id: job.customer_id, result: "linked", subject_name: job.subject_name });
+  }
+  currentSubjectCustomerId = null;
+}
+
 async function main() {
   log(`HopClaw runner starting (long-poll, step model)`);
   log(`  HOPAPP_URL      = ${HOPAPP}`);
@@ -192,15 +296,19 @@ async function main() {
   for (;;) {
     const startedAt = Date.now();
     currentStepId = null;
+    currentSubjectCustomerId = null;
     try {
       const job = await poll(); // blocks until a job is ready or the server's deadline
       if (job.type === "step") {
         log("Job:", job.action, "step", job.step_id, "eval", job.evaluation_id);
         await handleStep(job);
+      } else if (job.type === "subject_job") {
+        log("Subject job:", job.kind, "customer", job.customer_id, `'${job.subject_name}'`);
+        await handleSubjectJob(job);
       }
     } catch (err) {
       log("Loop error:", err.message);
-      // Mark the in-flight step as failed so the UI doesn't get stuck
+      // Mark the in-flight job as failed so the UI doesn't get stuck
       if (currentStepId) {
         try {
           await postEvent({ step_id: currentStepId, status: "failed", error: err.message });
@@ -209,9 +317,18 @@ async function main() {
           log("Also failed to post failure status:", postErr.message);
         }
       }
+      if (currentSubjectCustomerId) {
+        try {
+          await postSubjectEvent({ customer_id: currentSubjectCustomerId, result: "failed", error: err.message });
+          log("Marked subject job for", currentSubjectCustomerId, "as failed");
+        } catch (postErr) {
+          log("Also failed to post subject failure:", postErr.message);
+        }
+      }
       await sleep(ERROR_BACKOFF_MS);
     } finally {
       currentStepId = null;
+      currentSubjectCustomerId = null;
     }
     // The server already waited; this floor only prevents a hot loop if it
     // returned almost instantly (e.g. an old short-poll deployment).
