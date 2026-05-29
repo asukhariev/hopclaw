@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * HopClaw runner — polls hop.agtc.app every POLL_MS for commands, drives
- * MR4 export on the lab Windows VM, uploads the result to Vercel Blob.
+ * HopClaw runner — long-polls hop.agtc.app for jobs (lab_runner evaluation
+ * steps), drives the MR4 export on the lab Windows machine, uploads the result
+ * to Vercel Blob, and reports step events back.
  *
  * Env vars (set in .env or shell):
  *   HOPAPP_URL              default https://hop.agtc.app
@@ -21,7 +22,7 @@ const BLOB_TOK = process.env.BLOB_READ_WRITE_TOKEN || "";
 const DIR      = process.env.HOPCLAW_DIR || "C:\\hopclaw";
 const POLL_MS  = Number(process.env.POLL_MS || 500);
 
-// Long-poll tuning. The server holds /api/runner/poll open until a command is
+// Long-poll tuning. The server holds /api/runner/poll open until a job is
 // ready or ~25s passes; the runner re-polls immediately on each response.
 const LONG_POLL_TIMEOUT_MS = 30_000; // client abort; must exceed the server's ~25s hold
 const IDLE_FLOOR_MS = POLL_MS;       // min gap only if the server returns fast (pre-deploy short-poll)
@@ -39,7 +40,7 @@ function authHeaders(extra = {}) {
 }
 
 async function poll() {
-  // Long-poll: the server holds this request open until a command is ready (or
+  // Long-poll: the server holds this request open until a job is ready (or
   // ~25s elapses). Abort a bit past the server's deadline so a dead connection
   // can't hang the loop forever.
   const ctrl = new AbortController();
@@ -84,25 +85,11 @@ function listSlkAndCsv(dirPath) {
 
 /**
  * Drive MR4 export via the PowerShell helpers already in C:\hopclaw\.
- * Sequence (assumes MR4 is open on Database tab with record selected):
- *   1. Click Export button (right sidebar)
- *   2. Click "Export Data to Single CSV Files" menu item
- *   3. Enter through filename dialog (accept default)
- *   4. Select Folder on folder picker (assumes C:\hopclaw\exports is target)
- *   5. Yes on overwrite confirm if any
- *   6. Wait for "Please wait..." to clear
- *   7. Enter to close success dialog
- *
- * v0 SHORT-CIRCUIT: if MR4 driving isn't ready, we just pick the latest
- * .slk/.csv already in HOPCLAW_DIR and upload that. Proves the full pipeline
- * end-to-end. Real driving plugs into the same callsite.
+ * Triggers the HopClawDriveExport scheduled task (runs in the interactive
+ * session — required for SendKeys/UI Automation to reach the MR4 window),
+ * then waits for the .ok / .err marker file.
  */
 async function driveExport() {
-  // Trigger the HopClawDriveExport scheduled task (runs in the user's
-  // interactive RDP session — required for SendKeys/UI Automation to reach
-  // the MR4 window). The PS script writes one of:
-  //   C:\hopclaw\drive-export.ok    -> full path to the new file
-  //   C:\hopclaw\drive-export.err   -> error message
   const okPath  = "C:\\hopclaw\\drive-export.ok";
   const errPath = "C:\\hopclaw\\drive-export.err";
   const exportDir = path.join(DIR, "exports");
@@ -147,10 +134,10 @@ async function driveExport() {
   throw new Error("drive-export timed out (90s) and no new file appeared");
 }
 
-async function uploadToBlob(sessionId, filePath) {
+async function uploadToBlob(keyPrefix, filePath) {
   const filename = path.basename(filePath);
   const data = fs.readFileSync(filePath);
-  const blobKey = `exports/${sessionId}/${filename}`;
+  const blobKey = `exports/${keyPrefix}/${filename}`;
   const contentType = filename.toLowerCase().endsWith(".csv")
     ? "text/csv"
     : "application/octet-stream";
@@ -164,64 +151,39 @@ async function uploadToBlob(sessionId, filePath) {
   return { url, filename, size: data.length };
 }
 
-async function handleStop(sessionId) {
-  await postEvent({
-    session_id: sessionId,
-    status: "exporting",
-    progress: "Driving MR4 Export -> CSV...",
-  });
+let currentStepId = null;
+
+/** Execute one lab_runner step: drive the MR4 export, upload it, attach the file. */
+async function handleStep(job) {
+  currentStepId = job.step_id;
+  if (job.action !== "mr4_export") {
+    throw new Error(`unknown lab_runner action: ${job.action}`);
+  }
+
+  await postEvent({ step_id: job.step_id, progress: "Driving MR4 Export -> CSV..." });
 
   const file = await driveExport();
   log("Picked file:", file.path, file.size, "bytes");
 
   await postEvent({
-    session_id: sessionId,
-    status: "uploading",
+    step_id: job.step_id,
     progress: `Uploading ${file.name} (${(file.size / 1024 / 1024).toFixed(1)} MB)...`,
   });
 
-  const uploaded = await uploadToBlob(sessionId, file.path);
+  const uploaded = await uploadToBlob(job.evaluation_id, file.path);
   log("Uploaded to:", uploaded.url);
 
   await postEvent({
-    session_id: sessionId,
+    step_id: job.step_id,
     status: "done",
     progress: "Available below.",
-    file_url: uploaded.url,
-    file_name: uploaded.filename,
-    file_size_bytes: uploaded.size,
+    result: { uploaded_at: new Date().toISOString() },
+    file: { url: uploaded.url, name: uploaded.filename, size_bytes: uploaded.size },
   });
-}
-
-async function handleStart(sessionId) {
-  // Recording acknowledged. Technician records in MR4 (or, in cloud demo,
-  // there's a pre-existing demo record waiting to be exported). When the
-  // user clicks Stop, handleStop drives the actual MR4 export.
-  await postEvent({
-    session_id: sessionId,
-    status: "recording",
-    progress: "Session running. Click Stop & Export when ready.",
-  });
-}
-
-let currentSessionId = null;
-
-async function handleCommand(cmd) {
-  if (cmd.type === "start") {
-    currentSessionId = cmd.session_id;
-    await handleStart(cmd.session_id);
-    // Auto-chain into the export flow so the operator only presses Start.
-    // (Real-recording mode would wait for an explicit stop command instead.)
-    log("Auto-chaining into export flow for session", cmd.session_id);
-    await handleStop(cmd.session_id);
-  } else if (cmd.type === "stop") {
-    currentSessionId = cmd.session_id;
-    await handleStop(cmd.session_id);
-  }
 }
 
 async function main() {
-  log(`HopClaw runner starting (long-poll)`);
+  log(`HopClaw runner starting (long-poll, step model)`);
   log(`  HOPAPP_URL      = ${HOPAPP}`);
   log(`  HOPCLAW_DIR     = ${DIR}`);
   log(`  IDLE_FLOOR_MS   = ${IDLE_FLOOR_MS}`);
@@ -229,31 +191,27 @@ async function main() {
   log(`  BLOB_READ_WRITE_TOKEN = ${BLOB_TOK ? "(set)" : "(unset)"}`);
   for (;;) {
     const startedAt = Date.now();
+    currentStepId = null;
     try {
-      const cmd = await poll(); // blocks until a command is ready or the server's deadline
-      if (cmd.type !== "noop") {
-        log("Command:", cmd);
-        await handleCommand(cmd);
+      const job = await poll(); // blocks until a job is ready or the server's deadline
+      if (job.type === "step") {
+        log("Job:", job.action, "step", job.step_id, "eval", job.evaluation_id);
+        await handleStep(job);
       }
     } catch (err) {
       log("Loop error:", err.message);
-      // Mark the in-flight session as failed so the UI doesn't get stuck
-      if (currentSessionId) {
+      // Mark the in-flight step as failed so the UI doesn't get stuck
+      if (currentStepId) {
         try {
-          await postEvent({
-            session_id: currentSessionId,
-            status: "failed",
-            error: err.message,
-            progress: `Failed: ${err.message}`,
-          });
-          log("Marked session", currentSessionId, "as failed");
+          await postEvent({ step_id: currentStepId, status: "failed", error: err.message });
+          log("Marked step", currentStepId, "as failed");
         } catch (postErr) {
           log("Also failed to post failure status:", postErr.message);
         }
       }
       await sleep(ERROR_BACKOFF_MS);
     } finally {
-      currentSessionId = null;
+      currentStepId = null;
     }
     // The server already waited; this floor only prevents a hot loop if it
     // returned almost instantly (e.g. an old short-poll deployment).
