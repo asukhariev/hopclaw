@@ -153,11 +153,48 @@ async function uploadToBlob(keyPrefix, filePath) {
   return { url, filename, size: data.length };
 }
 
+/**
+ * Drive MR4 measure-start: navigate to the gait|running protocol and (only if
+ * armed via C:\hopclaw\measure.go) click MEASURE. Navigation-only by default —
+ * a real recording never starts unless the box is explicitly armed.
+ */
+async function driveMeasure(target) {
+  const okPath  = "C:\\hopclaw\\drive-measure.ok";
+  const errPath = "C:\\hopclaw\\drive-measure.err";
+  for (const p of [okPath, errPath]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  fs.writeFileSync("C:\\hopclaw\\measure.target", target === "running" ? "running" : "gait", "ascii");
+  log(`Triggering MR4 measure-start (target=${target}; nav-only unless measure.go armed)...`);
+  const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveMeasure"], { encoding: "utf-8" });
+  if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(okPath)) return fs.readFileSync(okPath, "utf-8").trim();
+    if (fs.existsSync(errPath)) throw new Error(`drive-measure reported: ${fs.readFileSync(errPath, "utf-8").trim()}`);
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  throw new Error("drive-measure timed out (60s)");
+}
+
 let currentStepId = null;
 
 /** Execute one lab_runner step: drive the MR4 export, upload it, attach the file. */
 async function handleStep(job) {
   currentStepId = job.step_id;
+
+  // Measure-start: navigate MR4 to the gait|running protocol (+ gated MEASURE).
+  if (job.action === "mr4_measure") {
+    const target = (job.config && job.config.target) || "gait";
+    await postEvent({ step_id: job.step_id, progress: `Navigating MR4 to the ${target} protocol…` });
+    const result = await driveMeasure(target);
+    await postEvent({
+      step_id: job.step_id,
+      status: "done",
+      progress: result,
+      result: { target, at: new Date().toISOString() },
+    });
+    return;
+  }
+
   if (job.action !== "mr4_export") {
     throw new Error(`unknown lab_runner action: ${job.action}`);
   }
