@@ -14,6 +14,7 @@ $log = "$dir\drive-measure.log"
 $ok  = "$dir\drive-measure.ok"
 $err = "$dir\drive-measure.err"
 Remove-Item $ok, $err -ErrorAction SilentlyContinue
+Remove-Item "$dir\measure-burst-*.png" -ErrorAction SilentlyContinue
 Start-Transcript -Path $log -Force | Out-Null
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -60,18 +61,48 @@ $protocolY = if ($target -eq "running") { 255 } else { 209 }
 Write-Host "TARGET: $target (protocol row y=$protocolY)"
 
 try {
-  Write-Host "STEP 1: reset (Escape x2)"; Send "{ESC}" "esc1"; Send "{ESC}" "esc2"; Snap "0-reset"
-  Write-Host "STEP 2: Home tab (948,47)"; Click 948 47 "Home tab"; Snap "1-home"
-  Write-Host "STEP 3: Gait tile (396,642)"; Click 396 642 "Gait tile"; Snap "2-gait"
-  Write-Host "STEP 4: protocol row (1460,$protocolY)"; Click 1460 $protocolY "protocol-$target"; Snap "3-protocol"
-
-  # MEASURE is gated: only click it when explicitly armed via measure.go
-  if (Test-Path "$dir\measure.go") {
-    Write-Host "STEP 5: MEASURE (1462,873) [ARMED]"; Click 1462 873 "MEASURE"; Start-Sleep -Seconds 2; Snap "4-after-measure"
-    Set-Content $ok "measure flow complete (target=$target, MEASURE clicked)" -Encoding ASCII
+  if (Test-Path "$dir\clicktext.go") {
+    # CLICKTEXT: find a dialog button by its text (OCR) and click it. Used for the
+    # Save Data modal (Save & View / Save & Measure Again).
+    $ctFind = ""; $ctAvoid = ""
+    if (Test-Path "$dir\clicktext.find") { $ctFind = (Get-Content "$dir\clicktext.find" -Raw).Trim() }
+    if (Test-Path "$dir\clicktext.avoid") { $ctAvoid = (Get-Content "$dir\clicktext.avoid" -Raw).Trim() }
+    Write-Host "CLICKTEXT: find='$ctFind' avoid='$ctAvoid'"
+    & "$dir\click-text.ps1" -Find $ctFind -Avoid $ctAvoid
+    if (Test-Path "$dir\clicktext.ok") { Set-Content $ok ("clicktext: " + (Get-Content "$dir\clicktext.ok" -Raw).Trim()) -Encoding ASCII }
+    else {
+      $ctErr = "clicktext failed"
+      if (Test-Path "$dir\clicktext.err") { $ctErr = (Get-Content "$dir\clicktext.err" -Raw).Trim() }
+      Set-Content $err $ctErr -Encoding ASCII
+    }
+  } elseif (Test-Path "$dir\next.go") {
+    # NEXT-only: click the bottom-right primary button (NEXT on the calibration
+    # screens — same coord as MEASURE). No navigation. Used to drive
+    # Calibrate Left Insole -> NEXT -> Calibrate Right Insole -> NEXT.
+    Write-Host "NEXT-ONLY: click (1462,873)"; Click 1462 873 "NEXT"; Start-Sleep -Milliseconds 1200
+    Set-Content $ok "next click done" -Encoding ASCII
   } else {
-    Write-Host "STEP 5: MEASURE skipped (nav-only; create measure.go to arm)"
-    Set-Content $ok "navigation complete (target=$target); MEASURE NOT clicked (nav-only)" -Encoding ASCII
+    Write-Host "STEP 1: reset (Escape x2)"; Send "{ESC}" "esc1"; Send "{ESC}" "esc2"
+    Write-Host "STEP 2: Home tab (948,47)"; Click 948 47 "Home tab"
+    Write-Host "STEP 3: Gait tile (396,642)"; Click 396 642 "Gait tile"
+    Write-Host "STEP 4: protocol row (1460,$protocolY)"; Click 1460 $protocolY "protocol-$target"
+
+    # MEASURE is gated: only click it when explicitly armed via measure.go
+    if (Test-Path "$dir\measure.go") {
+      Write-Host "STEP 5: MEASURE (1462,873) [ARMED]"; Click 1462 873 "MEASURE"
+      # Brief settle so MR4 lands on the measurement screen. The slow ~20s wait is
+      # gone, so launch stays fast. Sensor status is read ONLY when explicitly
+      # requested via readsensors.go (the Devices "check" command) — never on a
+      # plain launch, which is what kept "Starting…" slow.
+      Start-Sleep -Seconds 3
+      if (Test-Path "$dir\readsensors.go") {
+        Write-Host "STEP 6: read device status (requested)"; try { & "$dir\read-sensors.ps1" } catch { Write-Host "read-sensors err: $_" }
+      }
+      Set-Content $ok "measure flow complete (target=$target, MEASURE clicked)" -Encoding ASCII
+    } else {
+      Write-Host "STEP 5: MEASURE skipped (nav-only; create measure.go to arm)"
+      Set-Content $ok "navigation complete (target=$target); MEASURE NOT clicked (nav-only)" -Encoding ASCII
+    }
   }
   Write-Host "DONE"
 } catch {

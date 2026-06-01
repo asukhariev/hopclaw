@@ -158,15 +158,19 @@ async function uploadToBlob(keyPrefix, filePath) {
  * armed via C:\hopclaw\measure.go) click MEASURE. Navigation-only by default —
  * a real recording never starts unless the box is explicitly armed.
  */
-async function driveMeasure(target, armed = false) {
+async function driveMeasure(target, armed = false, readSensors = false) {
   const okPath  = "C:\\hopclaw\\drive-measure.ok";
   const errPath = "C:\\hopclaw\\drive-measure.err";
   const goPath  = "C:\\hopclaw\\measure.go";
+  const rsPath  = "C:\\hopclaw\\readsensors.go";
   for (const p of [okPath, errPath]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
   fs.writeFileSync("C:\\hopclaw\\measure.target", target === "running" ? "running" : "gait", "ascii");
   if (armed) fs.writeFileSync(goPath, "1", "ascii");
   else { try { fs.unlinkSync(goPath); } catch { /* ignore */ } }
-  log(`Triggering MR4 measure-start (target=${target}; ${armed ? "ARMED — clicks MEASURE" : "nav-only"})...`);
+  // Sensor OCR only when asked (Devices "check") — never on launch, to stay fast.
+  if (armed && readSensors) fs.writeFileSync(rsPath, "1", "ascii");
+  else { try { fs.unlinkSync(rsPath); } catch { /* ignore */ } }
+  log(`Triggering MR4 measure-start (target=${target}; ${armed ? "ARMED — clicks MEASURE" : "nav-only"}${readSensors ? " +read-sensors" : ""})...`);
   const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveMeasure"], { encoding: "utf-8" });
   if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
   try {
@@ -179,6 +183,35 @@ async function driveMeasure(target, armed = false) {
     throw new Error("drive-measure timed out (60s)");
   } finally {
     if (armed) { try { fs.unlinkSync(goPath); } catch { /* ignore */ } } // always disarm
+    try { fs.unlinkSync(rsPath); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Click NEXT — the bottom-right primary button (same coord as MEASURE) — without
+ * navigating. Used to advance the calibration screens (Calibrate Left -> NEXT ->
+ * Calibrate Right -> NEXT). drive-measure.ps1 sees next.go and clicks (1462,873).
+ */
+async function driveNext() {
+  const okPath  = "C:\\hopclaw\\drive-measure.ok";
+  const errPath = "C:\\hopclaw\\drive-measure.err";
+  const nextGo  = "C:\\hopclaw\\next.go";
+  for (const p of [okPath, errPath]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  try { fs.unlinkSync("C:\\hopclaw\\measure.go"); } catch { /* ignore */ } // ensure not nav-mode
+  fs.writeFileSync(nextGo, "1", "ascii");
+  log("Triggering MR4 NEXT click (calibration)...");
+  const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveMeasure"], { encoding: "utf-8" });
+  if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
+  try {
+    const deadline = Date.now() + 40_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(okPath)) return fs.readFileSync(okPath, "utf-8").trim();
+      if (fs.existsSync(errPath)) throw new Error(`drive-measure(next) reported: ${fs.readFileSync(errPath, "utf-8").trim()}`);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    throw new Error("drive-measure(next) timed out (40s)");
+  } finally {
+    try { fs.unlinkSync(nextGo); } catch { /* ignore */ }
   }
 }
 
@@ -305,6 +338,49 @@ async function driveSubjectSelect(subjectName) {
   return false;
 }
 
+/**
+ * Find a dialog button by its text (OCR) and click it — for the Save Data modal
+ * (Save & View / Save & Measure Again), where a fixed coord is risky. Reuses the
+ * HopClawDriveMeasure task in clicktext mode.
+ */
+async function driveClickText(find, avoid) {
+  const okPath = "C:\\hopclaw\\drive-measure.ok";
+  const errPath = "C:\\hopclaw\\drive-measure.err";
+  const goPath = "C:\\hopclaw\\clicktext.go";
+  for (const p of [okPath, errPath, "C:\\hopclaw\\clicktext.ok", "C:\\hopclaw\\clicktext.err"]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  for (const p of ["C:\\hopclaw\\next.go", "C:\\hopclaw\\measure.go"]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  fs.writeFileSync("C:\\hopclaw\\clicktext.find", find, "ascii");
+  fs.writeFileSync("C:\\hopclaw\\clicktext.avoid", avoid || "", "ascii");
+  fs.writeFileSync(goPath, "1", "ascii");
+  log(`Triggering MR4 click-text: find='${find}' avoid='${avoid}'`);
+  const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveMeasure"], { encoding: "utf-8" });
+  if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
+  try {
+    const deadline = Date.now() + 40_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(okPath)) return fs.readFileSync(okPath, "utf-8").trim();
+      if (fs.existsSync(errPath)) throw new Error(`click-text: ${fs.readFileSync(errPath, "utf-8").trim()}`);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    throw new Error("click-text timed out (40s)");
+  } finally {
+    try { fs.unlinkSync(goPath); } catch { /* ignore */ }
+  }
+}
+
+/** Read the device-connection status that drive-measure.ps1 wrote (it invokes
+ *  read-sensors.ps1 to OCR MR4's "Could not find sensors: …" dialog). Local
+ *  only — never uploaded anywhere. */
+function readSensorsJson() {
+  try {
+    const j = JSON.parse(fs.readFileSync("C:\\hopclaw\\sensors.json", "utf-8"));
+    return { connected: !!j.connected, missing: Array.isArray(j.missing) ? j.missing : [] };
+  } catch (e) {
+    log(`readSensorsJson failed (non-fatal): ${e.message}`);
+    return { connected: false, missing: [] };
+  }
+}
+
 async function handleLabJob(job) {
   currentSubjectCustomerId = job.customer_id;
 
@@ -323,23 +399,94 @@ async function handleLabJob(job) {
     log(`create '${job.subject_name}' -> selected`);
     await postSubjectEvent({ customer_id: job.customer_id, result: "selected", subject_name: job.subject_name });
   } else if (job.kind === "launch") {
-    // Launch a test: re-select the subject (guarantee the right patient), then
-    // navigate to the gait|running protocol and click MEASURE -> in_session.
+    // The subject is already selected (separate select clickflow + MR4 stays
+    // reserved for this patient), so go straight to the protocol + MEASURE and
+    // land on the measurement screen. We do NOT wait for / read sensors here —
+    // that happens on demand in the Devices step (check command), which keeps
+    // the "Starting…" launch fast.
     const target = job.target === "running" ? "running" : "gait";
-    const ok = await driveSubjectSelect(job.subject_name);
-    if (!ok) {
-      log(`launch: subject '${job.subject_name}' not found -> not_found`);
-      await postSubjectEvent({ customer_id: job.customer_id, result: "not_found" });
-    } else {
-      log(`launch: selected '${job.subject_name}', driving ${target} + MEASURE`);
-      await driveMeasure(target, true); // armed: actually clicks MEASURE
-      await postSubjectEvent({ customer_id: job.customer_id, result: "in_session", subject_name: job.subject_name });
-    }
+    log(`launch: driving ${target} + MEASURE for '${job.subject_name}' (already selected)`);
+    await driveMeasure(target, true); // armed: clicks MEASURE, brief settle, returns
+    await postSubjectEvent({ customer_id: job.customer_id, result: "in_session", subject_name: job.subject_name });
   }
   currentSubjectCustomerId = null;
 }
 
+/** In-session command: click NEXT (calibration) or re-check device connection. */
+async function handleCommand(job) {
+  currentSubjectCustomerId = job.customer_id;
+  if (job.kind === "next") {
+    log(`command: NEXT (calibration) for '${job.subject_name}'`);
+    await driveNext();
+    await postSubjectEvent({ customer_id: job.customer_id, result: "next_done", subject_name: job.subject_name });
+  } else if (job.kind === "check") {
+    // Re-scan: re-run the measure flow (its nav Escape closes the old dialog) and
+    // read the refreshed device-connection status.
+    const target = job.target === "running" ? "running" : "gait";
+    log(`command: re-check devices (re-scan ${target}) for '${job.subject_name}'`);
+    await driveMeasure(target, true, true); // read-sensors: this is the device check
+    const dev = readSensorsJson();
+    log(`re-check: devices -> ${dev.missing.length ? "MISSING " + dev.missing.join(",") : "connected"}`);
+    await postSubjectEvent({ customer_id: job.customer_id, result: "devices", subject_name: job.subject_name, missing: dev.missing });
+  } else if (job.kind === "record") {
+    // Tests step: click RECORD (the bottom-right primary button, same coord as
+    // NEXT). The technician then runs the test in MR4 to the Save dialog.
+    log(`command: RECORD (tests) for '${job.subject_name}'`);
+    await driveNext(); // clicks (1462,873) = RECORD on the Preview screen
+    await postSubjectEvent({ customer_id: job.customer_id, result: "recording", subject_name: job.subject_name });
+  } else if (job.kind === "save_again") {
+    // Save Data modal: click "Save & Measure Again" (save + re-record the whole test).
+    log(`command: Save & Measure Again for '${job.subject_name}'`);
+    await driveClickText("measure again", "discard");
+    await postSubjectEvent({ customer_id: job.customer_id, result: "rerecord", subject_name: job.subject_name });
+  } else if (job.kind === "save_view") {
+    // Save Data modal: click "Save & View" (save the evaluation, go to view/report).
+    log(`command: Save & View for '${job.subject_name}'`);
+    await driveClickText("view", "");
+    await postSubjectEvent({ customer_id: job.customer_id, result: "saved", subject_name: job.subject_name });
+  } else if (job.kind === "report_nav") {
+    // After Save & View: Report → Next → Next → Next (all the bottom-right button).
+    log(`command: report nav (Report -> Next x3) for '${job.subject_name}'`);
+    for (let i = 0; i < 4; i++) {
+      await driveNext(); // clicks (1462,873): REPORT, then NEXT x3
+      await sleep(2500); // let the next report screen load
+    }
+    await postSubjectEvent({ customer_id: job.customer_id, result: "reported", subject_name: job.subject_name });
+  } else if (job.kind === "activate") {
+    // Calibration already done — MR4 shows the Activate page; click ACTIVATE
+    // (bottom-right primary button, same coord as NEXT) to reach the test.
+    log(`command: ACTIVATE (calibration already done) for '${job.subject_name}'`);
+    await driveNext(); // clicks (1462,873) = ACTIVATE
+    await postSubjectEvent({ customer_id: job.customer_id, result: "activated", subject_name: job.subject_name });
+  }
+  currentSubjectCustomerId = null;
+}
+
+/**
+ * Single-instance guard. A `schtasks /end` restart kills start.cmd but ORPHANS
+ * its node child — and a non-admin SSH session can't taskkill that child across
+ * the session boundary, so stale runners pile up and race for jobs (an old one
+ * can win and run outdated behavior). We run inside the interactive session as
+ * the same user, so here we CAN kill our siblings: drop every other node.exe on
+ * startup, leaving only this process. Orphans have no start.cmd parent, so they
+ * never respawn.
+ */
+function enforceSingleInstance() {
+  try {
+    const r = spawnSync(
+      "taskkill",
+      ["/F", "/FI", "IMAGENAME eq node.exe", "/FI", `PID ne ${process.pid}`],
+      { encoding: "utf-8" }
+    );
+    const out = `${r.stdout || ""}${r.stderr || ""}`.replace(/\s+/g, " ").trim();
+    log(`single-instance (pid ${process.pid}): ${out || "no siblings"}`);
+  } catch (e) {
+    log(`single-instance: kill failed (non-fatal): ${e.message}`);
+  }
+}
+
 async function main() {
+  enforceSingleInstance();
   log(`HopClaw runner starting (long-poll, step model)`);
   log(`  HOPAPP_URL      = ${HOPAPP}`);
   log(`  HOPCLAW_DIR     = ${DIR}`);
@@ -358,6 +505,9 @@ async function main() {
       } else if (job.type === "lab_job") {
         log("Lab job:", job.kind, "customer", job.customer_id, `'${job.subject_name}'`);
         await handleLabJob(job);
+      } else if (job.type === "command") {
+        log("Command:", job.kind, "customer", job.customer_id, `'${job.subject_name}'`);
+        await handleCommand(job);
       }
     } catch (err) {
       log("Loop error:", err.message);
