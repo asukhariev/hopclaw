@@ -158,21 +158,28 @@ async function uploadToBlob(keyPrefix, filePath) {
  * armed via C:\hopclaw\measure.go) click MEASURE. Navigation-only by default —
  * a real recording never starts unless the box is explicitly armed.
  */
-async function driveMeasure(target) {
+async function driveMeasure(target, armed = false) {
   const okPath  = "C:\\hopclaw\\drive-measure.ok";
   const errPath = "C:\\hopclaw\\drive-measure.err";
+  const goPath  = "C:\\hopclaw\\measure.go";
   for (const p of [okPath, errPath]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
   fs.writeFileSync("C:\\hopclaw\\measure.target", target === "running" ? "running" : "gait", "ascii");
-  log(`Triggering MR4 measure-start (target=${target}; nav-only unless measure.go armed)...`);
+  if (armed) fs.writeFileSync(goPath, "1", "ascii");
+  else { try { fs.unlinkSync(goPath); } catch { /* ignore */ } }
+  log(`Triggering MR4 measure-start (target=${target}; ${armed ? "ARMED — clicks MEASURE" : "nav-only"})...`);
   const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveMeasure"], { encoding: "utf-8" });
   if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
-  const deadline = Date.now() + 60_000;
-  while (Date.now() < deadline) {
-    if (fs.existsSync(okPath)) return fs.readFileSync(okPath, "utf-8").trim();
-    if (fs.existsSync(errPath)) throw new Error(`drive-measure reported: ${fs.readFileSync(errPath, "utf-8").trim()}`);
-    await new Promise((r) => setTimeout(r, 1500));
+  try {
+    const deadline = Date.now() + 60_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(okPath)) return fs.readFileSync(okPath, "utf-8").trim();
+      if (fs.existsSync(errPath)) throw new Error(`drive-measure reported: ${fs.readFileSync(errPath, "utf-8").trim()}`);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    throw new Error("drive-measure timed out (60s)");
+  } finally {
+    if (armed) { try { fs.unlinkSync(goPath); } catch { /* ignore */ } } // always disarm
   }
-  throw new Error("drive-measure timed out (60s)");
 }
 
 let currentStepId = null;
@@ -298,29 +305,36 @@ async function driveSubjectSelect(subjectName) {
   return false;
 }
 
-async function handleSubjectJob(job) {
+async function handleLabJob(job) {
   currentSubjectCustomerId = job.customer_id;
-  const code = (job.mr4_code || "").toLowerCase();
 
-  if (job.kind === "find" || job.kind === "select") {
-    // Select-as-check: locate the subject in MR4's live dropdown (covers in-memory
-    // subjects) and select it. Success = found AND now selected; fail = not in MR4.
+  if (job.kind === "select") {
+    // Select the subject in MR4's live dropdown. found+selected -> ready; else not_found.
     const ok = await driveSubjectSelect(job.subject_name);
-    log(`select-as-check '${job.subject_name}' -> ${ok ? "linked" : "not_found"}`);
+    log(`select '${job.subject_name}' -> ${ok ? "selected" : "not_found"}`);
     await postSubjectEvent(
       ok
-        ? { customer_id: job.customer_id, result: "linked", subject_name: job.subject_name }
+        ? { customer_id: job.customer_id, result: "selected", subject_name: job.subject_name }
         : { customer_id: job.customer_id, result: "not_found" }
     );
   } else if (job.kind === "create") {
-    // Guard against duplicates: if we already linked this customer, the subject
-    // exists in MR4 (possibly only in memory, so find can't see it) — don't recreate.
-    if (job.already_linked) {
-      log(`create skipped — already linked, avoiding duplicate: ${job.subject_name}`);
+    // Create the subject (New dialog) — it auto-selects on OK -> ready.
+    await driveSubjectCreate(job.subject_name);
+    log(`create '${job.subject_name}' -> selected`);
+    await postSubjectEvent({ customer_id: job.customer_id, result: "selected", subject_name: job.subject_name });
+  } else if (job.kind === "launch") {
+    // Launch a test: re-select the subject (guarantee the right patient), then
+    // navigate to the gait|running protocol and click MEASURE -> in_session.
+    const target = job.target === "running" ? "running" : "gait";
+    const ok = await driveSubjectSelect(job.subject_name);
+    if (!ok) {
+      log(`launch: subject '${job.subject_name}' not found -> not_found`);
+      await postSubjectEvent({ customer_id: job.customer_id, result: "not_found" });
     } else {
-      await driveSubjectCreate(job.subject_name);
+      log(`launch: selected '${job.subject_name}', driving ${target} + MEASURE`);
+      await driveMeasure(target, true); // armed: actually clicks MEASURE
+      await postSubjectEvent({ customer_id: job.customer_id, result: "in_session", subject_name: job.subject_name });
     }
-    await postSubjectEvent({ customer_id: job.customer_id, result: "linked", subject_name: job.subject_name });
   }
   currentSubjectCustomerId = null;
 }
@@ -341,9 +355,9 @@ async function main() {
       if (job.type === "step") {
         log("Job:", job.action, "step", job.step_id, "eval", job.evaluation_id);
         await handleStep(job);
-      } else if (job.type === "subject_job") {
-        log("Subject job:", job.kind, "customer", job.customer_id, `'${job.subject_name}'`);
-        await handleSubjectJob(job);
+      } else if (job.type === "lab_job") {
+        log("Lab job:", job.kind, "customer", job.customer_id, `'${job.subject_name}'`);
+        await handleLabJob(job);
       }
     } catch (err) {
       log("Loop error:", err.message);
