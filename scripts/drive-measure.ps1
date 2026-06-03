@@ -42,6 +42,20 @@ function Click([int]$x, [int]$y, [string]$label) {
   [W]::mouse_event(0x0002, 0, 0, 0, 0); Start-Sleep -Milliseconds 60; [W]::mouse_event(0x0004, 0, 0, 0, 0)
   Write-Host "  click ($x,$y) - $label"; Start-Sleep -Milliseconds 800
 }
+function FocusSaveDialog {
+  # The Save Data modal is its OWN window ("Save Data"), NOT the main "Noraxon MR"
+  # window. Activating the main window can raise it OVER the modal so a coord click
+  # misses. Focus the dialog itself; fall back to the main window if not found.
+  $w = New-Object -ComObject WScript.Shell
+  foreach ($t in @("Save Data", "Save data", "SaveData", "Noraxon MR", "MR 4")) { if ($w.AppActivate($t)) { Start-Sleep -Milliseconds 400; return $t } }
+  return ""
+}
+function ClickDialog([int]$x, [int]$y, [string]$label) {
+  $fw = FocusSaveDialog
+  [W]::SetCursorPos($x, $y) | Out-Null; Start-Sleep -Milliseconds 250
+  [W]::mouse_event(0x0002, 0, 0, 0, 0); Start-Sleep -Milliseconds 60; [W]::mouse_event(0x0004, 0, 0, 0, 0)
+  Write-Host "  clickDialog ($x,$y) focus='$fw' - $label"; Start-Sleep -Milliseconds 900
+}
 function Send([string]$keys, [string]$label) {
   FocusMR4; [System.Windows.Forms.SendKeys]::SendWait($keys)
   Write-Host "  send '$keys' - $label"; Start-Sleep -Milliseconds 300
@@ -65,39 +79,56 @@ try {
     # CLICKTEXT: find a dialog button by its text (OCR) and click it. Used for the
     # Save Data modal (Save & View / Save & Measure Again).
     $ctFind = ""; $ctAvoid = ""
-    if (Test-Path "$dir\clicktext.find") { $ctFind = (Get-Content "$dir\clicktext.find" -Raw).Trim() }
-    if (Test-Path "$dir\clicktext.avoid") { $ctAvoid = (Get-Content "$dir\clicktext.avoid" -Raw).Trim() }
+    if (Test-Path "$dir\clicktext.find") { $ctFind = ([string](Get-Content "$dir\clicktext.find" -Raw)).Trim() }
+    if (Test-Path "$dir\clicktext.avoid") { $ctAvoid = ([string](Get-Content "$dir\clicktext.avoid" -Raw)).Trim() }
     Write-Host "CLICKTEXT: find='$ctFind' avoid='$ctAvoid'"
-    & "$dir\click-text.ps1" -Find $ctFind -Avoid $ctAvoid
-    if (Test-Path "$dir\clicktext.ok") { Set-Content $ok ("clicktext: " + (Get-Content "$dir\clicktext.ok" -Raw).Trim()) -Encoding ASCII }
-    else {
-      $ctErr = "clicktext failed"
-      if (Test-Path "$dir\clicktext.err") { $ctErr = (Get-Content "$dir\clicktext.err" -Raw).Trim() }
-      Set-Content $err $ctErr -Encoding ASCII
+    # Calibrated click coords for the Save Data modal (1600x900) -- reliable vs OCR.
+    # Save & View center=(988,569); Save & Measure Again=(858,569); Discard=(700,569).
+    $fl = $ctFind.ToLower()
+    if ($fl -like "*view*") {
+      ClickDialog 988 569 "Save & View (calibrated)"; Set-Content $ok "clickxy: Save and View 988,569 (dialog-focused)" -Encoding ASCII
+    } elseif ($fl -like "*again*" -or $fl -like "*measure*") {
+      ClickDialog 858 569 "Save & Measure Again (calibrated)"; Set-Content $ok "clickxy: Save and Measure Again 858,569 (dialog-focused)" -Encoding ASCII
+    } else {
+      & "$dir\click-text.ps1" -Find $ctFind -Avoid $ctAvoid
+      if (Test-Path "$dir\clicktext.ok") { Set-Content $ok ("clicktext: " + (Get-Content "$dir\clicktext.ok" -Raw).Trim()) -Encoding ASCII }
+      else {
+        $ctErr = "clicktext failed"
+        if (Test-Path "$dir\clicktext.err") { $ctErr = (Get-Content "$dir\clicktext.err" -Raw).Trim() }
+        Set-Content $err $ctErr -Encoding ASCII
+      }
     }
+  } elseif (Test-Path "$dir\clickxy.go") {
+    # Generic calibrated click at X,Y read from clickxy.x / clickxy.y. OCR-free;
+    # used for report-config controls (Activity radio, Post-processing dropdown,
+    # dropdown item) whose layout is fixed on the 1600x900 screen.
+    $cx = [int](([string](Get-Content "$dir\clickxy.x" -Raw)).Trim())
+    $cy = [int](([string](Get-Content "$dir\clickxy.y" -Raw)).Trim())
+    Write-Host "CLICKXY: ($cx,$cy)"; Snap "clickxy-before"
+    Click $cx $cy "clickxy ($cx,$cy)"
+    Start-Sleep -Milliseconds 700; Snap "clickxy-after"
+    Set-Content $ok "clickxy: $cx,$cy" -Encoding ASCII
   } elseif (Test-Path "$dir\next.go") {
     # NEXT-only: click the bottom-right primary button (NEXT on the calibration
     # screens — same coord as MEASURE). No navigation. Used to drive
     # Calibrate Left Insole -> NEXT -> Calibrate Right Insole -> NEXT.
-    Write-Host "NEXT-ONLY: click (1462,873)"; Click 1462 873 "NEXT"; Start-Sleep -Milliseconds 1200
+    Write-Host "NEXT-ONLY: click (1462,873)"; Snap "next-before"; Click 1462 873 "NEXT"; Start-Sleep -Milliseconds 1500; Snap "next-after"
     Set-Content $ok "next click done" -Encoding ASCII
   } else {
-    Write-Host "STEP 1: reset (Escape x2)"; Send "{ESC}" "esc1"; Send "{ESC}" "esc2"
-    Write-Host "STEP 2: Home tab (948,47)"; Click 948 47 "Home tab"
-    Write-Host "STEP 3: Gait tile (396,642)"; Click 396 642 "Gait tile"
-    Write-Host "STEP 4: protocol row (1460,$protocolY)"; Click 1460 $protocolY "protocol-$target"
+    Write-Host "STEP 1: reset (Escape x2)"; Send "{ESC}" "esc1"; Send "{ESC}" "esc2"; Snap "0-reset"
+    Write-Host "STEP 2: Home tab (948,47)"; Click 948 47 "Home tab"; Snap "1-home"
+    Write-Host "STEP 3: Gait tile (396,642)"; Click 396 642 "Gait tile"; Snap "2-gait"
+    Write-Host "STEP 4: protocol row (1460,$protocolY)"; Click 1460 $protocolY "protocol-$target"; Snap "3-protocol"
 
     # MEASURE is gated: only click it when explicitly armed via measure.go
     if (Test-Path "$dir\measure.go") {
       Write-Host "STEP 5: MEASURE (1462,873) [ARMED]"; Click 1462 873 "MEASURE"
-      # Brief settle so MR4 lands on the measurement screen. The slow ~20s wait is
-      # gone, so launch stays fast. Sensor status is read ONLY when explicitly
-      # requested via readsensors.go (the Devices "check" command) — never on a
-      # plain launch, which is what kept "Starting…" slow.
-      Start-Sleep -Seconds 3
-      if (Test-Path "$dir\readsensors.go") {
-        Write-Host "STEP 6: read device status (requested)"; try { & "$dir\read-sensors.ps1" } catch { Write-Host "read-sensors err: $_" }
-      }
+      # Wait for hardware activation to settle on the landing screen. No Escape —
+      # leave MR4 there so the session can continue (calibration).
+      Start-Sleep -Seconds 20
+      # Read the device-connection status off the screen (the "Could not find
+      # sensors: …" dialog) into sensors.json for the app. Live-screen OCR only.
+      Write-Host "STEP 6: read device status"; try { & "$dir\read-sensors.ps1" } catch { Write-Host "read-sensors err: $_" }
       Set-Content $ok "measure flow complete (target=$target, MEASURE clicked)" -Encoding ASCII
     } else {
       Write-Host "STEP 5: MEASURE skipped (nav-only; create measure.go to arm)"
@@ -106,6 +137,6 @@ try {
   }
   Write-Host "DONE"
 } catch {
-  Set-Content $err $_.Exception.Message -Encoding ASCII
+  Set-Content $err ($_.Exception.Message + " @line " + $_.InvocationInfo.ScriptLineNumber) -Encoding ASCII
 }
 Stop-Transcript | Out-Null
