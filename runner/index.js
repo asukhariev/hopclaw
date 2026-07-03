@@ -339,6 +339,35 @@ async function driveSubjectSelect(subjectName) {
 }
 
 /**
+ * Generic calibrated click at (x,y) — OCR-free. drive-measure.ps1 sees clickxy.go
+ * and clicks the coord. Used for the report-wizard controls (Activity radio,
+ * Post-processing dropdown, Define Periods Set) whose layout is fixed at 1600x900.
+ */
+async function driveClickXY(x, y, label) {
+  const okPath = "C:\\hopclaw\\drive-measure.ok";
+  const errPath = "C:\\hopclaw\\drive-measure.err";
+  const goPath = "C:\\hopclaw\\clickxy.go";
+  for (const p of [okPath, errPath, "C:\\hopclaw\\clicktext.go", "C:\\hopclaw\\next.go", "C:\\hopclaw\\measure.go"]) { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  fs.writeFileSync("C:\\hopclaw\\clickxy.x", String(x), "ascii");
+  fs.writeFileSync("C:\\hopclaw\\clickxy.y", String(y), "ascii");
+  fs.writeFileSync(goPath, "1", "ascii");
+  log(`Triggering MR4 clickxy (${x},${y}) — ${label}`);
+  const trig = spawnSync("schtasks.exe", ["/Run", "/TN", "HopClawDriveMeasure"], { encoding: "utf-8" });
+  if (trig.status !== 0) throw new Error(`schtasks /Run failed: ${trig.stderr || trig.stdout}`);
+  try {
+    const deadline = Date.now() + 40_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(okPath)) return fs.readFileSync(okPath, "utf-8").trim();
+      if (fs.existsSync(errPath)) throw new Error(`clickxy(${label}): ${fs.readFileSync(errPath, "utf-8").trim()}`);
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    throw new Error(`clickxy(${label}) timed out (40s)`);
+  } finally {
+    try { fs.unlinkSync(goPath); } catch { /* ignore */ }
+  }
+}
+
+/**
  * Find a dialog button by its text (OCR) and click it — for the Save Data modal
  * (Save & View / Save & Measure Again), where a fixed coord is risky. Reuses the
  * HopClawDriveMeasure task in clicktext mode.
@@ -445,13 +474,39 @@ async function handleCommand(job) {
     await driveClickText("view", "");
     await postSubjectEvent({ customer_id: job.customer_id, result: "saved", subject_name: job.subject_name });
   } else if (job.kind === "report_nav") {
-    // After Save & View: Report → Next → Next → Next (all the bottom-right button).
-    log(`command: report nav (Report -> Next x3) for '${job.subject_name}'`);
-    for (let i = 0; i < 4; i++) {
-      await driveNext(); // clicks (1462,873): REPORT, then NEXT x3
-      await sleep(2500); // let the next report screen load
-    }
+    // After Save & View: drive the MR4 report wizard with calibrated clicks (1600x900).
+    // REPORT → Define Tracking Intervals (Activity by test type + Standard
+    // post-processing, NEXT) → Tracking View (NEXT) → Define Periods (Set, THEN
+    // NEXT — NEXT without Set throws the "No periods found" dialog). Screens past
+    // Define Periods are not mapped yet; the flow stops there for now.
+    const target = job.target === "running" ? "running" : "gait";
+    log(`command: report wizard (target=${target}) for '${job.subject_name}'`);
+    await driveNext(); // (1462,873) = REPORT — enter the wizard
+    await sleep(2500); // let Define Tracking Intervals load
+    if (target === "running") await driveClickXY(1441, 190, "Activity: Running");
+    else await driveClickXY(1365, 190, "Activity: Walking");
+    await driveClickXY(1467, 251, "Post-processing dropdown");
+    await driveClickXY(1467, 355, "Post-processing: Standard");
+    await driveNext(); // NEXT → Tracking View
+    await sleep(2500);
+    await driveNext(); // Tracking View NEXT → Define Periods
+    await sleep(2500);
+    await driveClickXY(1465, 162, "Define Periods: Set");
+    await driveNext(); // NEXT → next wizard screen (unmapped — mapping continues live)
+    await sleep(2500);
     await postSubjectEvent({ customer_id: job.customer_id, result: "reported", subject_name: job.subject_name });
+  } else if (job.kind === "report_next") {
+    // Report wizard: one NEXT click (1462,873) — the technician confirmed the
+    // current report screen finished generating. Repeatable per screen.
+    log(`command: report NEXT for '${job.subject_name}'`);
+    await driveNext();
+    await postSubjectEvent({ customer_id: job.customer_id, result: "report_next_done", subject_name: job.subject_name });
+  } else if (job.kind === "report_set") {
+    // Report wizard period screens (Set Left/Right Periods): click the SET
+    // button in the right panel — (1462,829), just above NEXT — before NEXT.
+    log(`command: report SET for '${job.subject_name}'`);
+    await driveClickXY(1462, 829, "Report: SET periods");
+    await postSubjectEvent({ customer_id: job.customer_id, result: "report_set_done", subject_name: job.subject_name });
   } else if (job.kind === "activate") {
     // Calibration already done — MR4 shows the Activate page; click ACTIVATE
     // (bottom-right primary button, same coord as NEXT) to reach the test.
