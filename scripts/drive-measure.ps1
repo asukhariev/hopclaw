@@ -78,9 +78,12 @@ try {
   if (Test-Path "$dir\clicktext.go") {
     # CLICKTEXT: find a dialog button by its text (OCR) and click it. Used for the
     # Save Data modal (Save & View / Save & Measure Again).
+    # NOTE: Get-Content -Raw on a 0-byte file returns AutomationNull, and on this
+    # PS 5.1 build the [string] cast does NOT coerce it to "" — .Trim() still
+    # throws "call a method on a null-valued expression". Guard the value itself.
     $ctFind = ""; $ctAvoid = ""
-    if (Test-Path "$dir\clicktext.find") { $ctFind = ([string](Get-Content "$dir\clicktext.find" -Raw)).Trim() }
-    if (Test-Path "$dir\clicktext.avoid") { $ctAvoid = ([string](Get-Content "$dir\clicktext.avoid" -Raw)).Trim() }
+    if (Test-Path "$dir\clicktext.find") { $raw = Get-Content "$dir\clicktext.find" -Raw; if ($raw) { $ctFind = $raw.Trim() } }
+    if (Test-Path "$dir\clicktext.avoid") { $raw = Get-Content "$dir\clicktext.avoid" -Raw; if ($raw) { $ctAvoid = $raw.Trim() } }
     Write-Host "CLICKTEXT: find='$ctFind' avoid='$ctAvoid'"
     # Calibrated click coords for the Save Data modal (1600x900) -- reliable vs OCR.
     # Save & View center=(988,569); Save & Measure Again=(858,569); Discard=(700,569).
@@ -91,7 +94,7 @@ try {
       ClickDialog 858 569 "Save & Measure Again (calibrated)"; Set-Content $ok "clickxy: Save and Measure Again 858,569 (dialog-focused)" -Encoding ASCII
     } else {
       & "$dir\click-text.ps1" -Find $ctFind -Avoid $ctAvoid
-      if (Test-Path "$dir\clicktext.ok") { Set-Content $ok ("clicktext: " + (Get-Content "$dir\clicktext.ok" -Raw).Trim()) -Encoding ASCII }
+      if (Test-Path "$dir\clicktext.ok") { $raw = Get-Content "$dir\clicktext.ok" -Raw; Set-Content $ok ("clicktext: " + $(if ($raw) { $raw.Trim() } else { "" })) -Encoding ASCII }
       else {
         $ctErr = "clicktext failed"
         if (Test-Path "$dir\clicktext.err") { $ctErr = (Get-Content "$dir\clicktext.err" -Raw).Trim() }
